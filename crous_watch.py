@@ -3,161 +3,126 @@ Surveille les nouvelles annonces de logement CROUS pour une ville donnée
 sur https://trouverunlogement.lescrous.fr et envoie un message Telegram
 des qu'une nouvelle annonce apparait.
 
+Contrairement a une premiere version, ce script n'utilise PAS de
+navigateur automatise : la page de resultats est en fait du HTML simple
+cote serveur, donc une requete HTTP classique suffit. C'est plus rapide
+et beaucoup plus fiable.
+
+Le filtre par ville du site necessite un clic JavaScript (autocomplete),
+donc on recupere TOUTE la liste des logements de France et on filtre
+nous-memes ceux dont l'adresse contient la ville recherchee.
+
 Tu n'as PAS besoin de comprendre ce fichier ni de le modifier (sauf la
-ville, en bas du fichier). Suis simplement le guide README.md.
+ville, dans le fichier .github/workflows/crous-watch.yml). Suis
+simplement le guide README.md.
 """
 
 import json
 import os
 import re
-import urllib.request
+import unicodedata
 import urllib.parse
+import urllib.request
 from pathlib import Path
 
-from playwright.sync_api import sync_playwright
+from bs4 import BeautifulSoup
 
 # ---------------------------------------------------------------------------
-# Configuration (viendra des "Secrets" GitHub, voir README.md)
+# Configuration (viendra des "Secrets"/variables GitHub, voir README.md)
 # ---------------------------------------------------------------------------
 
-SEARCH_URL = "https://trouverunlogement.lescrous.fr/tools/47/search"
+BASE_URL = "https://trouverunlogement.lescrous.fr/tools/47/search"
 CITY_QUERY = os.environ.get("CROUS_CITY", "Grenoble")
 STATE_FILE = Path(__file__).parent / "seen_listings.json"
+MAX_PAGES = 20  # garde-fou pour ne jamais boucler indefiniment
 
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID")
 
+HEADERS = {
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+        "(KHTML, like Gecko) Chrome/124.0 Safari/537.36"
+    ),
+    "Accept-Language": "fr-FR,fr;q=0.9",
+}
+
+
+def strip_accents(text):
+    return "".join(
+        c for c in unicodedata.normalize("NFKD", text)
+        if not unicodedata.combining(c)
+    ).lower()
+
 
 # ---------------------------------------------------------------------------
-# Scraping
+# Recuperation des annonces (HTML simple, pas de navigateur)
 # ---------------------------------------------------------------------------
 
-def dismiss_cookie_banner(page):
-    """Ferme le bandeau de cookies s'il est present (best-effort, ne bloque
-    jamais le reste du script en cas d'echec)."""
-    try:
-        button = page.get_by_role(
-            "button",
-            name=re.compile(r"accepter|tout accepter|j'accepte|ok", re.IGNORECASE),
-        ).first
-        if button.count() > 0 and button.is_visible(timeout=3000):
-            button.click(timeout=3000)
-            page.wait_for_timeout(500)
-    except Exception:
-        pass  # pas de bandeau de cookies, ou deja ferme : on continue
+def fetch_page(page_number):
+    url = f"{BASE_URL}?page={page_number}" if page_number > 1 else BASE_URL
+    req = urllib.request.Request(url, headers=HEADERS)
+    with urllib.request.urlopen(req, timeout=30) as resp:
+        return resp.read().decode("utf-8", errors="replace")
 
 
-def find_search_input(page):
-    """Essaie plusieurs strategies pour trouver le champ de recherche de
-    ville, car le site n'expose pas toujours un placeholder explicite."""
-
-    strategies = [
-        lambda: page.get_by_placeholder(re.compile("ville|résidence|lieu", re.IGNORECASE)).first,
-        lambda: page.get_by_label(re.compile("ville|résidence|lieu", re.IGNORECASE)).first,
-        # Repli : le premier input texte visible dans le panneau "Filtrer"
-        lambda: page.locator(
-            "input[type='text'], input[type='search'], input:not([type])"
-        ).first,
-    ]
-
-    for strategy in strategies:
-        try:
-            candidate = strategy()
-            candidate.wait_for(state="visible", timeout=8000)
-            return candidate
-        except Exception:
-            continue
-
-    return None
-
-
-def fetch_listings():
-    """Ouvre la page de recherche, filtre sur la ville, renvoie une liste
-    de dicts {id, url, text} pour chaque logement affiche."""
-
+def parse_listings(html):
+    """Extrait les logements {id, url, text} d'une page de resultats."""
+    soup = BeautifulSoup(html, "html.parser")
     listings = []
 
-    with sync_playwright() as p:
-        browser = p.chromium.launch()
-        page = browser.new_page(locale="fr-FR")
-        page.set_default_timeout(60000)
-        # "networkidle" ne se declenche jamais sur ce site (activite reseau
-        # continue en arriere-plan) : on attend juste le chargement du DOM.
-        page.goto(SEARCH_URL, wait_until="domcontentloaded")
-        page.wait_for_timeout(2000)
+    for link in soup.find_all("a", href=re.compile(r"/accommodations/\d+")):
+        match = re.search(r"/accommodations/(\d+)", link["href"])
+        if not match:
+            continue
+        listing_id = match.group(1)
 
-        dismiss_cookie_banner(page)
+        # On remonte de quelques niveaux pour recuperer le bloc complet
+        # (prix, adresse, surface...) autour du lien.
+        container = link
+        for _ in range(3):
+            if container.parent is not None:
+                container = container.parent
+        text = container.get_text(separator=" | ", strip=True)
 
-        search_box = find_search_input(page)
+        listings.append({
+            "id": listing_id,
+            "url": f"https://trouverunlogement.lescrous.fr/tools/47/accommodations/{listing_id}",
+            "text": text,
+        })
 
-        if search_box is None:
-            # On ne trouve aucun champ : on garde une preuve visuelle pour
-            # pouvoir diagnostiquer sans avoir besoin d'acces au navigateur.
-            try:
-                Path("debug_screenshot.png").write_bytes(
-                    page.screenshot(full_page=False, timeout=15000)
-                )
-            except Exception as e:
-                print(f"[!] Capture d'ecran impossible : {e}")
-            try:
-                Path("debug_page.html").write_text(page.content())
-            except Exception as e:
-                print(f"[!] Sauvegarde du HTML impossible : {e}")
-            browser.close()
-            raise RuntimeError(
-                "Champ de recherche introuvable. Voir debug_screenshot.png "
-                "et debug_page.html (telecharges comme artefacts du run)."
-            )
+    # Nombre total de pages, si mentionne sur la page ("page 1 sur 3")
+    total_pages = 1
+    page_info = re.search(r"page\s+\d+\s+sur\s+(\d+)", soup.get_text(), re.IGNORECASE)
+    if page_info:
+        total_pages = int(page_info.group(1))
 
-        search_box.click()
-        search_box.fill(CITY_QUERY)
+    return listings, total_pages
 
-        page.wait_for_timeout(1500)
-        suggestion = page.locator("li, [role='option']").filter(has_text=CITY_QUERY).first
-        if suggestion.count() > 0:
-            suggestion.click()
-        else:
-            search_box.press("Enter")
 
-        page.wait_for_timeout(3000)
+def fetch_all_listings():
+    all_listings = {}
+    page_number = 1
+    total_pages = 1
 
-        cards = page.locator("a[href*='/accommodations/']")
-        count = cards.count()
+    while page_number <= min(total_pages, MAX_PAGES):
+        html = fetch_page(page_number)
+        listings, total_pages = parse_listings(html)
 
-        if count == 0:
-            # Toujours rien : capture de secours pour diagnostiquer.
-            try:
-                Path("debug_screenshot.png").write_bytes(
-                    page.screenshot(full_page=False, timeout=15000)
-                )
-            except Exception as e:
-                print(f"[!] Capture d'ecran impossible : {e}")
-            try:
-                Path("debug_page.html").write_text(page.content())
-            except Exception as e:
-                print(f"[!] Sauvegarde du HTML impossible : {e}")
+        if not listings:
+            break
 
-        for i in range(count):
-            link = cards.nth(i)
-            href = link.get_attribute("href") or ""
-            match = re.search(r"/accommodations/(\d+)", href)
-            if not match:
-                continue
-            listing_id = match.group(1)
+        for listing in listings:
+            all_listings[listing["id"]] = listing
 
-            container = link.locator("xpath=ancestor::li[1]")
-            text = container.inner_text() if container.count() > 0 else link.inner_text()
+        page_number += 1
 
-            listings.append({
-                "id": listing_id,
-                "url": f"https://trouverunlogement.lescrous.fr/tools/47/accommodations/{listing_id}",
-                "text": " | ".join(line.strip() for line in text.splitlines() if line.strip()),
-            })
+    return list(all_listings.values())
 
-        browser.close()
 
-    unique = {l["id"]: l for l in listings}
-    return list(unique.values())
+def filter_by_city(listings, city):
+    needle = strip_accents(city)
+    return [l for l in listings if needle in strip_accents(l["text"])]
 
 
 # ---------------------------------------------------------------------------
@@ -203,21 +168,21 @@ def send_telegram(message):
 
 def main():
     print(f"Recherche des logements CROUS pour : {CITY_QUERY}")
-    listings = fetch_listings()
-    print(f"{len(listings)} logement(s) trouve(s) sur le site.")
 
-    if not listings:
-        print("[!] Aucun logement trouve - verifie que les selecteurs Playwright "
-              "correspondent toujours a la structure actuelle du site.")
+    all_listings = fetch_all_listings()
+    print(f"{len(all_listings)} logement(s) au total en France.")
+
+    matching = filter_by_city(all_listings, CITY_QUERY)
+    print(f"{len(matching)} logement(s) correspondant a '{CITY_QUERY}'.")
 
     seen_ids = load_seen_ids()
-    current_ids = {l["id"] for l in listings}
-    new_listings = [l for l in listings if l["id"] not in seen_ids]
+    current_ids = {l["id"] for l in matching}
+    new_listings = [l for l in matching if l["id"] not in seen_ids]
 
     if new_listings:
         print(f"{len(new_listings)} nouveau(x) logement(s) !")
         for l in new_listings:
-            message = f"🏠 Nouveau logement CROUS a {CITY_QUERY} :\n{l['text'][:200]}\n{l['url']}"
+            message = f"🏠 Nouveau logement CROUS a {CITY_QUERY} :\n{l['text'][:250]}\n{l['url']}"
             send_telegram(message)
     else:
         print("Aucun nouveau logement depuis la derniere verification.")
