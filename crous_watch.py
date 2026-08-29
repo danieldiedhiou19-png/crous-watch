@@ -41,9 +41,14 @@ def fetch_listings():
     with sync_playwright() as p:
         browser = p.chromium.launch()
         page = browser.new_page(locale="fr-FR")
-        page.goto(SEARCH_URL, wait_until="networkidle")
+        page.set_default_timeout(60000)
+        # "networkidle" ne se declenche jamais sur ce site (activite reseau
+        # continue en arriere-plan) : on attend juste le chargement du DOM,
+        # puis le champ de recherche lui-meme.
+        page.goto(SEARCH_URL, wait_until="domcontentloaded")
 
         search_box = page.get_by_placeholder(re.compile("Ville", re.IGNORECASE))
+        search_box.wait_for(state="visible")
         search_box.click()
         search_box.fill(CITY_QUERY)
 
@@ -54,8 +59,7 @@ def fetch_listings():
         else:
             search_box.press("Enter")
 
-        page.wait_for_load_state("networkidle")
-        page.wait_for_timeout(2000)
+        page.wait_for_timeout(3000)
 
         cards = page.locator("a[href*='/accommodations/']")
         count = cards.count()
