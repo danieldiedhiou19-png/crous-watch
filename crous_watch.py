@@ -93,8 +93,16 @@ def fetch_listings():
         if search_box is None:
             # On ne trouve aucun champ : on garde une preuve visuelle pour
             # pouvoir diagnostiquer sans avoir besoin d'acces au navigateur.
-            Path("debug_screenshot.png").write_bytes(page.screenshot(full_page=True))
-            Path("debug_page.html").write_text(page.content())
+            try:
+                Path("debug_screenshot.png").write_bytes(
+                    page.screenshot(full_page=False, timeout=15000)
+                )
+            except Exception as e:
+                print(f"[!] Capture d'ecran impossible : {e}")
+            try:
+                Path("debug_page.html").write_text(page.content())
+            except Exception as e:
+                print(f"[!] Sauvegarde du HTML impossible : {e}")
             browser.close()
             raise RuntimeError(
                 "Champ de recherche introuvable. Voir debug_screenshot.png "
@@ -118,8 +126,16 @@ def fetch_listings():
 
         if count == 0:
             # Toujours rien : capture de secours pour diagnostiquer.
-            Path("debug_screenshot.png").write_bytes(page.screenshot(full_page=True))
-            Path("debug_page.html").write_text(page.content())
+            try:
+                Path("debug_screenshot.png").write_bytes(
+                    page.screenshot(full_page=False, timeout=15000)
+                )
+            except Exception as e:
+                print(f"[!] Capture d'ecran impossible : {e}")
+            try:
+                Path("debug_page.html").write_text(page.content())
+            except Exception as e:
+                print(f"[!] Sauvegarde du HTML impossible : {e}")
 
         for i in range(count):
             link = cards.nth(i)
