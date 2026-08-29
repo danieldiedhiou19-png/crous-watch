@@ -32,6 +32,45 @@ TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID")
 # Scraping
 # ---------------------------------------------------------------------------
 
+def dismiss_cookie_banner(page):
+    """Ferme le bandeau de cookies s'il est present (best-effort, ne bloque
+    jamais le reste du script en cas d'echec)."""
+    try:
+        button = page.get_by_role(
+            "button",
+            name=re.compile(r"accepter|tout accepter|j'accepte|ok", re.IGNORECASE),
+        ).first
+        if button.count() > 0 and button.is_visible(timeout=3000):
+            button.click(timeout=3000)
+            page.wait_for_timeout(500)
+    except Exception:
+        pass  # pas de bandeau de cookies, ou deja ferme : on continue
+
+
+def find_search_input(page):
+    """Essaie plusieurs strategies pour trouver le champ de recherche de
+    ville, car le site n'expose pas toujours un placeholder explicite."""
+
+    strategies = [
+        lambda: page.get_by_placeholder(re.compile("ville|résidence|lieu", re.IGNORECASE)).first,
+        lambda: page.get_by_label(re.compile("ville|résidence|lieu", re.IGNORECASE)).first,
+        # Repli : le premier input texte visible dans le panneau "Filtrer"
+        lambda: page.locator(
+            "input[type='text'], input[type='search'], input:not([type])"
+        ).first,
+    ]
+
+    for strategy in strategies:
+        try:
+            candidate = strategy()
+            candidate.wait_for(state="visible", timeout=8000)
+            return candidate
+        except Exception:
+            continue
+
+    return None
+
+
 def fetch_listings():
     """Ouvre la page de recherche, filtre sur la ville, renvoie une liste
     de dicts {id, url, text} pour chaque logement affiche."""
@@ -43,12 +82,25 @@ def fetch_listings():
         page = browser.new_page(locale="fr-FR")
         page.set_default_timeout(60000)
         # "networkidle" ne se declenche jamais sur ce site (activite reseau
-        # continue en arriere-plan) : on attend juste le chargement du DOM,
-        # puis le champ de recherche lui-meme.
+        # continue en arriere-plan) : on attend juste le chargement du DOM.
         page.goto(SEARCH_URL, wait_until="domcontentloaded")
+        page.wait_for_timeout(2000)
 
-        search_box = page.get_by_placeholder(re.compile("Ville", re.IGNORECASE))
-        search_box.wait_for(state="visible")
+        dismiss_cookie_banner(page)
+
+        search_box = find_search_input(page)
+
+        if search_box is None:
+            # On ne trouve aucun champ : on garde une preuve visuelle pour
+            # pouvoir diagnostiquer sans avoir besoin d'acces au navigateur.
+            Path("debug_screenshot.png").write_bytes(page.screenshot(full_page=True))
+            Path("debug_page.html").write_text(page.content())
+            browser.close()
+            raise RuntimeError(
+                "Champ de recherche introuvable. Voir debug_screenshot.png "
+                "et debug_page.html (telecharges comme artefacts du run)."
+            )
+
         search_box.click()
         search_box.fill(CITY_QUERY)
 
@@ -63,6 +115,11 @@ def fetch_listings():
 
         cards = page.locator("a[href*='/accommodations/']")
         count = cards.count()
+
+        if count == 0:
+            # Toujours rien : capture de secours pour diagnostiquer.
+            Path("debug_screenshot.png").write_bytes(page.screenshot(full_page=True))
+            Path("debug_page.html").write_text(page.content())
 
         for i in range(count):
             link = cards.nth(i)
