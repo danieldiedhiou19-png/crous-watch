@@ -20,7 +20,9 @@ simplement le guide README.md.
 import json
 import os
 import re
+import time
 import unicodedata
+import urllib.error
 import urllib.parse
 import urllib.request
 from pathlib import Path
@@ -32,7 +34,10 @@ from bs4 import BeautifulSoup
 # ---------------------------------------------------------------------------
 
 BASE_URL = "https://trouverunlogement.lescrous.fr/tools/47/search"
-CITY_QUERY = os.environ.get("CROUS_CITY", "Grenoble")
+# Ville(s)/agglomeration a surveiller, separees par des virgules dans la
+# variable d'environnement CROUS_CITY (voir crous-watch.yml). Exemple :
+# "Grenoble,La Tronche,Saint-Martin-d'Heres,Gieres,Echirolles,Fontaine"
+CITY_QUERIES = [c.strip() for c in os.environ.get("CROUS_CITY", "Grenoble").split(",") if c.strip()]
 STATE_FILE = Path(__file__).parent / "seen_listings.json"
 MAX_PAGES = 20  # garde-fou pour ne jamais boucler indefiniment
 
@@ -48,22 +53,36 @@ HEADERS = {
 }
 
 
-def strip_accents(text):
-    return "".join(
+def normalize(text):
+    """Normalise un texte pour la comparaison : minuscules, sans accents,
+    et sans ponctuation (espaces, tirets, apostrophes courbes ou droites...).
+    Ainsi "Saint-Martin-d'Hères" et "saint martin d'heres" sont equivalents."""
+    text = "".join(
         c for c in unicodedata.normalize("NFKD", text)
         if not unicodedata.combining(c)
     ).lower()
+    return re.sub(r"[^a-z0-9]", "", text)
 
 
 # ---------------------------------------------------------------------------
 # Recuperation des annonces (HTML simple, pas de navigateur)
 # ---------------------------------------------------------------------------
 
-def fetch_page(page_number):
+def fetch_page(page_number, max_retries=3):
     url = f"{BASE_URL}?page={page_number}" if page_number > 1 else BASE_URL
     req = urllib.request.Request(url, headers=HEADERS)
-    with urllib.request.urlopen(req, timeout=30) as resp:
-        return resp.read().decode("utf-8", errors="replace")
+
+    last_error = None
+    for attempt in range(1, max_retries + 1):
+        try:
+            with urllib.request.urlopen(req, timeout=30) as resp:
+                return resp.read().decode("utf-8", errors="replace")
+        except (urllib.error.URLError, TimeoutError) as e:
+            last_error = e
+            print(f"[!] Tentative {attempt}/{max_retries} echouee ({e}), nouvel essai...")
+            time.sleep(5)
+
+    raise last_error
 
 
 def parse_listings(html):
@@ -120,9 +139,20 @@ def fetch_all_listings():
     return list(all_listings.values())
 
 
-def filter_by_city(listings, city):
-    needle = strip_accents(city)
-    return [l for l in listings if needle in strip_accents(l["text"])]
+def filter_by_city(listings, cities):
+    """Garde les logements dont l'adresse contient au moins une des villes
+    fournies (comparaison insensible aux accents, a la casse et a la
+    ponctuation : espaces, tirets, apostrophes...)."""
+    needles = [normalize(c) for c in cities]
+    matched = []
+    for l in listings:
+        haystack = normalize(l["text"])
+        found = next((c for c, n in zip(cities, needles) if n in haystack), None)
+        if found:
+            l = dict(l)
+            l["matched_city"] = found
+            matched.append(l)
+    return matched
 
 
 # ---------------------------------------------------------------------------
@@ -167,13 +197,13 @@ def send_telegram(message):
 # ---------------------------------------------------------------------------
 
 def main():
-    print(f"Recherche des logements CROUS pour : {CITY_QUERY}")
+    print(f"Recherche des logements CROUS pour : {', '.join(CITY_QUERIES)}")
 
     all_listings = fetch_all_listings()
     print(f"{len(all_listings)} logement(s) au total en France.")
 
-    matching = filter_by_city(all_listings, CITY_QUERY)
-    print(f"{len(matching)} logement(s) correspondant a '{CITY_QUERY}'.")
+    matching = filter_by_city(all_listings, CITY_QUERIES)
+    print(f"{len(matching)} logement(s) correspondant a la zone recherchee.")
 
     seen_ids = load_seen_ids()
     current_ids = {l["id"] for l in matching}
@@ -182,7 +212,10 @@ def main():
     if new_listings:
         print(f"{len(new_listings)} nouveau(x) logement(s) !")
         for l in new_listings:
-            message = f"🏠 Nouveau logement CROUS a {CITY_QUERY} :\n{l['text'][:250]}\n{l['url']}"
+            message = (
+                f"🏠 Nouveau logement CROUS ({l['matched_city']}) :\n"
+                f"{l['text'][:250]}\n{l['url']}"
+            )
             send_telegram(message)
     else:
         print("Aucun nouveau logement depuis la derniere verification.")
