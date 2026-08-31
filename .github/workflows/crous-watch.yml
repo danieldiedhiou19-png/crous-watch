@@ -24,7 +24,7 @@ jobs:
 
       - name: Lancer la verification
         env:
-          CROUS_CITY: "Grenoble"
+        CROUS_CITY: "Grenoble,La Tronche,Saint-Martin-d'Heres,Gieres,Echirolles,Fontaine"
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
         run: python crous_watch.py
